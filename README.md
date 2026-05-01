@@ -8,6 +8,8 @@ A space-aware incremental package updater for Arch Linux on SD cards and other s
 
 Works on any space-constrained drive — SD cards, USB sticks, external HDDs. Also useful when a neglected Arch install has a mess of stale keys causing PGP signature failures: the keyring is refreshed automatically at the start of every run.
 
+Works on any space-constrained drive — SD cards, USB sticks, external HDDs. Also useful when a neglected Arch install has a mess of stale keys causing PGP signature failures: the keyring is refreshed automatically at the start of every run.
+
 ## Features
 
 - Updates largest packages first to maximize gains before space runs out
