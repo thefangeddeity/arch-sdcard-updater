@@ -237,19 +237,23 @@ show_timeout_summary() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
-# ── Keyring refresh ───────────────────────────────────────────────────────────
-
-echo "==> Refreshing keyring..."
-sudo pacman -Sy --noconfirm archlinux-keyring
-sudo pacman-key --populate archlinux
-
-# ── Sync and collect updatable packages ──────────────────────────────────────
+# ── Sync databases ───────────────────────────────────────────────────────────
 
 echo "==> Syncing package databases..."
 sudo pacman -Syy --noconfirm
 
+# ── Keyring refresh (only if archlinux-keyring has an update) ────────────────
+
+echo "==> Checking keyring..."
+if pacman -Qu archlinux-keyring 2>/dev/null | grep -q archlinux-keyring; then
+    echo "==> Keyring update available — refreshing..."
+    sudo pacman -S --noconfirm archlinux-keyring
+    sudo pacman-key --populate archlinux
+else
+    echo "==> Keyring up to date — skipping."
+fi
 echo "==> Collecting updatable packages..."
-mapfile -t UPDATABLE < <(yay -Qua 2>/dev/null | awk '{print $1}')
+mapfile -t UPDATABLE < <({ pacman -Qu 2>/dev/null; yay -Qua --aur 2>/dev/null; } | awk '{print $1}' | sort -u)
 
 if [[ ${#UPDATABLE[@]} -eq 0 ]]; then
     echo "==> Nothing to update."
@@ -262,84 +266,62 @@ echo "==> ${#UPDATABLE[@]} package(s) have updates."
 declare -A UPDATABLE_SET
 for p in "${UPDATABLE[@]}"; do UPDATABLE_SET["$p"]=1; done
 
-# ── Adaptive sort ─────────────────────────────────────────────────────────────
+# ── Build queue: repo first (smallest to largest), then AUR (smallest to largest)
+# Uses expac local db for sizes — covers both repo and AUR installed packages
 
-# Get sizes for all updatable packages (KiB)
-declare -A PKG_SIZE_KB
-while IFS= read -r line; do
-    pkg=$(echo "$line" | awk '{print $2}')
-    kb=$(echo "$line" | awk '{print $1}')
-    PKG_SIZE_KB["$pkg"]=$kb
-done < <(
-    LC_ALL=C yay -Qi "${!UPDATABLE_SET[@]}" 2>/dev/null \
-    | awk '
-        /^Name/          { name=$3 }
-        /^Installed Size/ {
-            val=$4; unit=$5
-            if      (unit ~ /GiB/) kb = val * 1024 * 1024
-            else if (unit ~ /MiB/) kb = val * 1024
-            else if (unit ~ /KiB/) kb = val
-            else                   kb = val / 1024
-            print kb, name
-        }
-    '
-)
+UPDATABLE_LIST=" ${!UPDATABLE_SET[@]} "
 
-# Find smallest package size
-smallest_kb=999999999
-for pkg in "${!UPDATABLE_SET[@]}"; do
-    kb=${PKG_SIZE_KB[$pkg]:-0}
-    if (( kb > 0 && kb < smallest_kb )); then
-        smallest_kb=$kb
-    fi
-done
+# Get sizes for all updatable packages
+SIZED_DATA=$(expac -Q '%m	%n' 2>/dev/null     | awk -v pkgs="$UPDATABLE_LIST" '{if (index(pkgs, " "$2" ")) print $1, $2}')
 
-free_kb=$(( $(free_mb) * 1024 ))
-survival_threshold_kb=$(( smallest_kb * SURVIVAL_MARGIN ))
+# Adaptive sort: survival mode if free space < smallest package * SURVIVAL_MARGIN
+smallest_bytes=$(echo "$SIZED_DATA" | awk 'BEGIN{m=99999999999} $1+0>0 && $1+0<m {m=$1+0} END{print m+0}')
+free_bytes=$(( $(free_mb) * 1024 * 1024 ))
+survival_threshold=$(( smallest_bytes * SURVIVAL_MARGIN ))
 
-if (( free_kb < survival_threshold_kb )); then
-    SORT_ORDER="largest-first"
+if (( smallest_bytes > 0 && free_bytes < survival_threshold )); then
     SORT_FLAG="-rn"
-    echo "==> SURVIVAL MODE: free space is less than ${SURVIVAL_MARGIN}x smallest package — sorting largest-first"
+    echo "==> SURVIVAL MODE: free space below ${SURVIVAL_MARGIN}x smallest package — sorting largest-first"
 else
-    SORT_ORDER="smallest-first"
     SORT_FLAG="-n"
     echo "==> Coverage mode: sorting smallest-first for maximum package count"
 fi
 
-# ── Build priority-ordered queue ─────────────────────────────────────────────
-
 declare -a QUEUE=()
 declare -A QUEUED=()
 
+# Tier 1 first
 for pkg in "${TIER1[@]}"; do
     if [[ -n "${UPDATABLE_SET[$pkg]+_}" ]]; then
         QUEUE+=("$pkg"); QUEUED["$pkg"]=1
     fi
 done
 
+# Tier 2 next
 for pkg in "${TIER2[@]}"; do
     if [[ -n "${UPDATABLE_SET[$pkg]+_}" ]] && [[ -z "${QUEUED[$pkg]+_}" ]]; then
         QUEUE+=("$pkg"); QUEUED["$pkg"]=1
     fi
 done
 
-mapfile -t SIZED < <(
-    for pkg in "${!UPDATABLE_SET[@]}"; do
-        echo "${PKG_SIZE_KB[$pkg]:-0} $pkg"
-    done | sort $SORT_FLAG | awk '{print $2}'
-)
+# Repo packages: smallest first, skip already queued
+while IFS= read -r pkg; do
+    if [[ -n "${UPDATABLE_SET[$pkg]+_}" ]] && [[ -z "${QUEUED[$pkg]+_}" ]] && pacman -Si "$pkg" &>/dev/null; then
+        QUEUE+=("$pkg"); QUEUED["$pkg"]=1
+    fi
+done < <(echo "$SIZED_DATA" | sort $SORT_FLAG | awk '{print $2}')
 
-for pkg in "${SIZED[@]}"; do
+# AUR packages: smallest first, skip already queued
+while IFS= read -r pkg; do
     if [[ -n "${UPDATABLE_SET[$pkg]+_}" ]] && [[ -z "${QUEUED[$pkg]+_}" ]]; then
         QUEUE+=("$pkg"); QUEUED["$pkg"]=1
     fi
-done
+done < <(echo "$SIZED_DATA" | sort $SORT_FLAG | awk '{print $2}')
 
 # ── Run the queue ─────────────────────────────────────────────────────────────
 
 echo ""
-echo "==> Update queue (${#QUEUE[@]} packages, $SORT_ORDER for Tier 3):"
+echo "==> Update queue (${#QUEUE[@]} packages: repo first, then AUR, smallest-first within each):"
 printf '    %s\n' "${QUEUE[@]}"
 echo ""
 
