@@ -1,68 +1,127 @@
 #!/usr/bin/env bash
-# arch-sdcard-update — space-aware incremental updater for Arch on SD card
-# Updates packages one at a time: priority tiers first, then largest-first.
-# Stops gracefully when free disk space drops below SPACE_THRESHOLD_MB.
+# arch-sdcard-updater — space-aware incremental updater for Arch on SD cards
+# Updates packages one at a time with adaptive sort and per-package timeouts.
 
 set -euo pipefail
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ── Config file ───────────────────────────────────────────────────────────────
 
-SPACE_THRESHOLD_MB=200          # stop if free space drops below this
-LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/arch-sdcard-update"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/arch-sdcard-updater"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" << 'EOF'
+# arch-sdcard-updater configuration
+# All changes take effect on next run.
+
+# Stop updating when free space drops below this (MB)
+SPACE_THRESHOLD_MB=200
+
+# Survival mode: if free_space < smallest_package * SURVIVAL_MARGIN,
+# switch to largest-first sort to maximize space recovered per install.
+# Otherwise smallest-first to maximize number of packages updated.
+SURVIVAL_MARGIN=2
+
+# Timeout for repo package installs (minutes). Repo packages only download
+# and install pre-built binaries — 5 min is generous.
+TIMEOUT_REPO_MIN=5
+
+# Timeout for AUR package builds (minutes). AUR packages may compile from
+# source. webkit2gtk, chromium etc. can take 1-2h on slow hardware.
+TIMEOUT_AUR_MIN=120
+EOF
+    echo "==> Config created at $CONFIG_FILE — edit to customize."
+fi
+
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+
+LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/arch-sdcard-updater"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 LOG_SUCCESS="$LOG_DIR/success-$TIMESTAMP.log"
 LOG_SKIP="$LOG_DIR/skip-$TIMESTAMP.log"
 LOG_FAIL="$LOG_DIR/fail-$TIMESTAMP.log"
-LOG_ORPHAN="$LOG_DIR/orphaned.log"          # persistent across runs
-
-# Tier 1: must update first or mid-session breakage is likely
-TIER1=(pacman glibc systemd systemd-libs filesystem)
-
-# Tier 2: high-risk if version-mismatched with rest of system
-TIER2=(linux linux-lts linux-zen linux-hardened mkinitcpio openssl gcc-libs libgcc)
-
-# ── Setup ────────────────────────────────────────────────────────────────────
+LOG_ORPHAN="$LOG_DIR/orphaned.log"
 
 mkdir -p "$LOG_DIR"
+
+# Packages that timed out — tracked for end-of-run advice
+TIMED_OUT_PKGS=()
+TIMED_OUT_TYPES=()
+
+# ── Priority tiers ────────────────────────────────────────────────────────────
+
+TIER1=(pacman glibc systemd systemd-libs filesystem)
+TIER2=(linux linux-lts linux-zen linux-hardened mkinitcpio openssl gcc-libs libgcc)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 log_success() { echo "$1" | tee -a "$LOG_SUCCESS"; }
 log_skip()    { echo "$1" | tee -a "$LOG_SKIP";    }
 log_fail()    { echo "$1" | tee -a "$LOG_FAIL";    }
 log_orphan()  {
-    # Only append if not already in the persistent list
     if ! grep -qxF "$1" "$LOG_ORPHAN" 2>/dev/null; then
         echo "$1" >> "$LOG_ORPHAN"
     fi
 }
 
-count_lines() {
-    [[ -f "$1" ]] && wc -l < "$1" || echo 0
-}
+count_lines() { [[ -f "$1" ]] && wc -l < "$1" || echo 0; }
 
-free_mb() {
-    df --output=avail -m / | tail -1 | tr -d ' '
-}
+free_mb() { df --output=avail -m / | tail -1 | tr -d ' '; }
 
 check_space() {
     local free
     free=$(free_mb)
     if (( free < SPACE_THRESHOLD_MB )); then
         echo ""
-        echo "==> STOPPING: free space ${free}MB is below threshold ${SPACE_THRESHOLD_MB}MB"
-        echo "==> See logs in $LOG_DIR"
+        echo "==> STOPPING: free space ${free}MB below threshold ${SPACE_THRESHOLD_MB}MB"
         show_orphan_summary
+        show_timeout_summary
+        echo "==> Logs: $LOG_DIR"
         exit 0
     fi
 }
 
-is_orphan() {
-    # Orphaned = not findable in any sync db AND not in AUR
-    ! pacman -Si "$1" &>/dev/null && ! yay -Si "$1" &>/dev/null
-}
+is_orphan() { ! pacman -Si "$1" &>/dev/null && ! yay -Si "$1" &>/dev/null; }
+is_aur()    { ! pacman -Si "$1" &>/dev/null; }
 
-is_aur() {
-    # AUR = not in any sync db (but findable via yay)
-    ! pacman -Si "$1" &>/dev/null
+# ── Timed installer ───────────────────────────────────────────────────────────
+
+run_with_timeout() {
+    local pkg="$1"
+    local timeout_min="$2"
+    local is_aur_pkg="$3"
+    local timeout_sec=$(( timeout_min * 60 ))
+
+    if [[ "$is_aur_pkg" == "true" ]]; then
+        yay -S --noconfirm --needed \
+            --answerdiff=None --answerclean=None \
+            --removemake --cleanafter \
+            "$pkg" &
+    else
+        sudo pacman -S --noconfirm --needed "$pkg" &
+    fi
+
+    local child_pid=$!
+    local elapsed=0
+
+    while kill -0 "$child_pid" 2>/dev/null; do
+        sleep 10
+        elapsed=$(( elapsed + 10 ))
+        if (( elapsed >= timeout_sec )); then
+            echo ""
+            echo "    TIMEOUT: $pkg exceeded ${timeout_min}min — killing"
+            kill "$child_pid" 2>/dev/null
+            wait "$child_pid" 2>/dev/null || true
+            return 2
+        fi
+    done
+
+    wait "$child_pid"
+    return $?
 }
 
 do_update() {
@@ -78,32 +137,36 @@ do_update() {
     fi
 
     if is_aur "$pkg"; then
-        if yay -S --noconfirm --needed \
-               --answerdiff=None --answerclean=None \
-               --removemake --cleanafter \
-               "$pkg" 2>&1; then
-            log_success "OK  [AUR] $pkg"
+        local rc
+        run_with_timeout "$pkg" "$TIMEOUT_AUR_MIN" "true" && rc=$? || rc=$?
+        if [[ $rc -eq 2 ]]; then
+            log_fail "TIMEOUT [AUR] $pkg"
+            TIMED_OUT_PKGS+=("$pkg")
+            TIMED_OUT_TYPES+=("AUR")
+        elif [[ $rc -eq 0 ]]; then
+            log_success "OK [AUR] $pkg"
         else
-            log_fail   "ERR [AUR] $pkg"
+            log_fail "ERR [AUR] $pkg"
         fi
     else
-        local output
-        if output=$(sudo pacman -S --noconfirm --needed "$pkg" 2>&1); then
-            if echo "$output" | grep -q "is up to date"; then
-                log_skip "SKIP [repo] $pkg"
-            else
-                log_success "OK   [repo] $pkg"
-            fi
+        local rc
+        run_with_timeout "$pkg" "$TIMEOUT_REPO_MIN" "false" && rc=$? || rc=$?
+        if [[ $rc -eq 2 ]]; then
+            log_fail "TIMEOUT [repo] $pkg"
+            TIMED_OUT_PKGS+=("$pkg")
+            TIMED_OUT_TYPES+=("repo")
+        elif [[ $rc -eq 0 ]]; then
+            log_success "OK [repo] $pkg"
         else
-            log_fail "ERR  [repo] $pkg"
+            log_fail "ERR [repo] $pkg"
         fi
     fi
 }
 
+# ── Orphan summary ────────────────────────────────────────────────────────────
+
 show_orphan_summary() {
-    if [[ ! -f "$LOG_ORPHAN" ]] || [[ ! -s "$LOG_ORPHAN" ]]; then
-        return
-    fi
+    if [[ ! -f "$LOG_ORPHAN" ]] || [[ ! -s "$LOG_ORPHAN" ]]; then return; fi
 
     declare -a SAFE=()
     declare -a BLOCKED=()
@@ -142,14 +205,35 @@ show_orphan_summary() {
             echo "    • $entry"
         done
         echo ""
-        echo "    To investigate:"
-        echo "      pacman -Qi <package-name>"
-        echo "    To force-remove anyway (risky):"
-        echo "      sudo pacman -Rns <package-name>"
+        echo "    To investigate:          pacman -Qi <package-name>"
+        echo "    To force-remove (risky): sudo pacman -Rns <package-name>"
     fi
 
     [[ -s "$LOG_ORPHAN" ]] || rm -f "$LOG_ORPHAN"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
 
+# ── Timeout summary ───────────────────────────────────────────────────────────
+
+show_timeout_summary() {
+    if [[ ${#TIMED_OUT_PKGS[@]} -eq 0 ]]; then return; fi
+
+    echo ""
+    echo "━━━ Timed-out packages ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "    These packages exceeded their timeout and were skipped."
+    echo "    Run them alone when you have time:"
+    echo ""
+    for i in "${!TIMED_OUT_PKGS[@]}"; do
+        local pkg="${TIMED_OUT_PKGS[$i]}"
+        local type="${TIMED_OUT_TYPES[$i]}"
+        if [[ "$type" == "AUR" ]]; then
+            echo "      yay -S $pkg"
+        else
+            echo "      sudo pacman -S $pkg"
+        fi
+    done
+    echo ""
+    echo "    To increase timeout, edit $CONFIG_FILE"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
@@ -165,7 +249,6 @@ echo "==> Syncing package databases..."
 sudo pacman -Syy --noconfirm
 
 echo "==> Collecting updatable packages..."
-
 mapfile -t UPDATABLE < <(yay -Qua 2>/dev/null | awk '{print $1}')
 
 if [[ ${#UPDATABLE[@]} -eq 0 ]]; then
@@ -177,30 +260,17 @@ fi
 echo "==> ${#UPDATABLE[@]} package(s) have updates."
 
 declare -A UPDATABLE_SET
-for p in "${UPDATABLE[@]}"; do
-    UPDATABLE_SET["$p"]=1
-done
+for p in "${UPDATABLE[@]}"; do UPDATABLE_SET["$p"]=1; done
 
-# ── Build priority-ordered queue ─────────────────────────────────────────────
+# ── Adaptive sort ─────────────────────────────────────────────────────────────
 
-declare -a QUEUE=()
-declare -A QUEUED=()
-
-for pkg in "${TIER1[@]}"; do
-    if [[ -n "${UPDATABLE_SET[$pkg]+_}" ]]; then
-        QUEUE+=("$pkg")
-        QUEUED["$pkg"]=1
-    fi
-done
-
-for pkg in "${TIER2[@]}"; do
-    if [[ -n "${UPDATABLE_SET[$pkg]+_}" ]] && [[ -z "${QUEUED[$pkg]+_}" ]]; then
-        QUEUE+=("$pkg")
-        QUEUED["$pkg"]=1
-    fi
-done
-
-mapfile -t SIZED < <(
+# Get sizes for all updatable packages (KiB)
+declare -A PKG_SIZE_KB
+while IFS= read -r line; do
+    pkg=$(echo "$line" | awk '{print $2}')
+    kb=$(echo "$line" | awk '{print $1}')
+    PKG_SIZE_KB["$pkg"]=$kb
+done < <(
     LC_ALL=C yay -Qi "${!UPDATABLE_SET[@]}" 2>/dev/null \
     | awk '
         /^Name/          { name=$3 }
@@ -212,22 +282,64 @@ mapfile -t SIZED < <(
             else                   kb = val / 1024
             print kb, name
         }
-    ' \
-    | sort -rn \
-    | awk '{print $2}'
+    '
+)
+
+# Find smallest package size
+smallest_kb=999999999
+for pkg in "${!UPDATABLE_SET[@]}"; do
+    kb=${PKG_SIZE_KB[$pkg]:-0}
+    if (( kb > 0 && kb < smallest_kb )); then
+        smallest_kb=$kb
+    fi
+done
+
+free_kb=$(( $(free_mb) * 1024 ))
+survival_threshold_kb=$(( smallest_kb * SURVIVAL_MARGIN ))
+
+if (( free_kb < survival_threshold_kb )); then
+    SORT_ORDER="largest-first"
+    SORT_FLAG="-rn"
+    echo "==> SURVIVAL MODE: free space is less than ${SURVIVAL_MARGIN}x smallest package — sorting largest-first"
+else
+    SORT_ORDER="smallest-first"
+    SORT_FLAG="-n"
+    echo "==> Coverage mode: sorting smallest-first for maximum package count"
+fi
+
+# ── Build priority-ordered queue ─────────────────────────────────────────────
+
+declare -a QUEUE=()
+declare -A QUEUED=()
+
+for pkg in "${TIER1[@]}"; do
+    if [[ -n "${UPDATABLE_SET[$pkg]+_}" ]]; then
+        QUEUE+=("$pkg"); QUEUED["$pkg"]=1
+    fi
+done
+
+for pkg in "${TIER2[@]}"; do
+    if [[ -n "${UPDATABLE_SET[$pkg]+_}" ]] && [[ -z "${QUEUED[$pkg]+_}" ]]; then
+        QUEUE+=("$pkg"); QUEUED["$pkg"]=1
+    fi
+done
+
+mapfile -t SIZED < <(
+    for pkg in "${!UPDATABLE_SET[@]}"; do
+        echo "${PKG_SIZE_KB[$pkg]:-0} $pkg"
+    done | sort $SORT_FLAG | awk '{print $2}'
 )
 
 for pkg in "${SIZED[@]}"; do
     if [[ -n "${UPDATABLE_SET[$pkg]+_}" ]] && [[ -z "${QUEUED[$pkg]+_}" ]]; then
-        QUEUE+=("$pkg")
-        QUEUED["$pkg"]=1
+        QUEUE+=("$pkg"); QUEUED["$pkg"]=1
     fi
 done
 
 # ── Run the queue ─────────────────────────────────────────────────────────────
 
 echo ""
-echo "==> Update queue (${#QUEUE[@]} packages):"
+echo "==> Update queue (${#QUEUE[@]} packages, $SORT_ORDER for Tier 3):"
 printf '    %s\n' "${QUEUE[@]}"
 echo ""
 
@@ -246,3 +358,4 @@ echo "    Free now: $( free_mb )MB"
 echo "    Logs    : $LOG_DIR"
 
 show_orphan_summary
+show_timeout_summary
