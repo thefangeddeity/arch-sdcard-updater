@@ -4,6 +4,16 @@
 
 set -euo pipefail
 
+# ── Argument parsing ────────────────────────────────────────────────────────────────────────────────
+
+SKIP_HEAVY=false
+for arg in "$@"; do
+    case "$arg" in
+        --skip-heavy) SKIP_HEAVY=true ;;
+        *) echo "Unknown argument: $arg"; exit 1 ;;
+    esac
+done
+
 # ── Config file ───────────────────────────────────────────────────────────────
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/arch-sdcard-updater"
@@ -30,12 +40,56 @@ TIMEOUT_REPO_MIN=5
 # Timeout for AUR package builds (minutes). AUR packages may compile from
 # source. webkit2gtk, chromium etc. can take 1-2h on slow hardware.
 TIMEOUT_AUR_MIN=120
+
+# Skip AUR packages with installed size above this (MB). --skip-heavy flag.
+HEAVY_THRESHOLD_MB=500
 EOF
     echo "==> Config created at $CONFIG_FILE — edit to customize."
 fi
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
+
+# ── Backfill missing config keys ─────────────────────────────────────────────────────
+
+if [[ -z "${HEAVY_THRESHOLD_MB+_}" ]]; then
+    printf '\n# Skip heavy AUR packages with --skip-heavy\nHEAVY_THRESHOLD_MB=500\n' >> "$CONFIG_FILE"
+    HEAVY_THRESHOLD_MB=500
+fi
+
+# ── SSH + tmux guard ──────────────────────────────────────────────────────────────
+
+if [[ -n "${SSH_CONNECTION:-}" ]] && [[ -z "${TMUX:-}" ]] && [[ -z "${STY:-}" ]]; then
+    if command -v tmux &>/dev/null; then
+        echo "==> SSH session detected without tmux."
+        echo "    Relaunching inside tmux session 'sdupdate'..."
+        echo "    If disconnected, reconnect and run: tmux attach -t sdupdate"
+        echo "    Caching sudo credentials..."
+        sudo -v
+        tmux new-session -d -s sdupdate "$0" "$@" 2>/dev/null || true
+        echo "    Attached. If disconnected, run: tmux attach -t sdupdate"
+        exec tmux attach -t sdupdate
+    else
+        echo "==> WARNING: SSH without tmux. Install for resilience: sudo pacman -S tmux"
+        echo "==> Continuing unprotected..."
+    fi
+fi
+
+# ── tmux session pause ──────────────────────────────────────────────────────────────
+
+tmux_pause() {
+    if [[ -n "${TMUX:-}" ]]; then
+        echo ""
+        read -rp "==> Press Enter to close tmux session..."
+    fi
+}
+tmux_error() {
+    echo ""
+    echo "==> CRASH at line $1: $2"
+    tmux_pause
+}
+trap 'tmux_error $LINENO "$BASH_COMMAND"' ERR
+trap tmux_pause EXIT
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
@@ -311,12 +365,21 @@ while IFS= read -r pkg; do
     fi
 done < <(echo "$SIZED_DATA" | sort $SORT_FLAG | awk '{print $2}')
 
-# AUR packages: smallest first, skip already queued
-while IFS= read -r pkg; do
+# AUR packages: sorted, skip already queued, skip heavy if flagged
+while IFS= read -r line; do
+    size=$(awk '{print $1}' <<< "$line")
+    pkg=$(awk '{print $2}' <<< "$line")
     if [[ -n "${UPDATABLE_SET[$pkg]+_}" ]] && [[ -z "${QUEUED[$pkg]+_}" ]]; then
+        if [[ "$SKIP_HEAVY" == "true" ]] && (( HEAVY_THRESHOLD_MB > 0 )) \
+           && (( size > HEAVY_THRESHOLD_MB * 1024 * 1024 )); then
+            echo "    SKIP-HEAVY: $pkg ($(( size / 1024 / 1024 ))MB) -- run 'yay -S $pkg' separately"
+            log_skip "HEAVY $pkg"
+            QUEUED["$pkg"]=1
+            continue
+        fi
         QUEUE+=("$pkg"); QUEUED["$pkg"]=1
     fi
-done < <(echo "$SIZED_DATA" | sort $SORT_FLAG | awk '{print $2}')
+done < <(echo "$SIZED_DATA" | sort $SORT_FLAG)
 
 # ── Run the queue ─────────────────────────────────────────────────────────────
 

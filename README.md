@@ -4,16 +4,19 @@ A space-aware incremental package updater for Arch Linux on SD cards and other s
 
 ## Why
 
-`pacman -Syu` fails with "not enough disk space" on small drives. This script updates packages one at a time, largest first, stopping gracefully when free space drops below a configurable threshold.
-
-Works on any space-constrained drive — SD cards, USB sticks, external HDDs. Also useful when a neglected Arch install has a mess of stale keys causing PGP signature failures: the keyring is refreshed automatically at the start of every run.
+`pacman -Syu` fails with "not enough disk space" on small drives. This script updates packages one at a time, stopping gracefully when free space drops below a configurable threshold.
 
 Works on any space-constrained drive — SD cards, USB sticks, external HDDs. Also useful when a neglected Arch install has a mess of stale keys causing PGP signature failures: the keyring is refreshed automatically at the start of every run.
 
 ## Features
 
-- Updates largest packages first to maximize gains before space runs out
+- Updates packages one at a time — largest first by default, smallest-first in coverage mode
 - Priority tiers: critical packages (glibc, systemd, pacman) always update first
+- Adaptive sort: coverage mode (smallest-first) by default; survival mode (largest-first) when free space is critically low
+- Per-package timeouts: 5 min for repo packages, 120 min for AUR builds
+- SSH resilience: auto-relaunches inside a named tmux session when run over SSH; survives disconnects
+- `--skip-heavy` flag: skips AUR packages above a configurable installed size threshold (default 500MB)
+- Config backfill: missing config keys are added automatically on upgrade — no manual migration needed
 - Detects and auto-removes orphaned packages with no dependents
 - Flags orphans still required by other packages, with instructions
 - Refreshes the keyring before every run to avoid PGP signature failures
@@ -23,6 +26,7 @@ Works on any space-constrained drive — SD cards, USB sticks, external HDDs. Al
 ## Requirements
 
 - `yay`
+- `tmux`
 - `bash` 4+
 
 ## Install
@@ -41,34 +45,24 @@ Both `arch-sdcard-updater` and `sdupdate` are available immediately — no furth
 git clone https://github.com/thefangeddeity/arch-sdcard-updater.git
 cd arch-sdcard-updater
 install -Dm755 arch-sdcard-updater.sh ~/.local/bin/arch-sdcard-updater
-
-# Add sdupdate alias to your shell rc
-SHELL_RC=""
-if [[ -f ~/.zshrc ]]; then
-    SHELL_RC=~/.zshrc
-elif [[ -f ~/.bashrc ]]; then
-    SHELL_RC=~/.bashrc
-fi
-
-if [[ -n "$SHELL_RC" ]]; then
-    echo 'alias sdupdate="arch-sdcard-updater"' >> "$SHELL_RC"
-    echo "Added alias to $SHELL_RC — restart your shell or source it"
-else
-    echo "Could not detect shell rc — add alias manually"
-fi
 ```
 
 ## Usage
 
 ```bash
-sdupdate
+sdupdate                # update everything
+sdupdate --skip-heavy  # skip AUR packages above HEAVY_THRESHOLD_MB
 ```
 
 ## Configuration
 
-Edit the variables at the top of the script:
+Config file is auto-created at `~/.config/arch-sdcard-updater/config` on first run.
 
 - `SPACE_THRESHOLD_MB` — stop when free space drops below this (default: 200)
+- `SURVIVAL_MARGIN` — switch to largest-first when free space < smallest package × this (default: 2)
+- `TIMEOUT_REPO_MIN` — per-package timeout for repo installs in minutes (default: 5)
+- `TIMEOUT_AUR_MIN` — per-package timeout for AUR builds in minutes (default: 120)
+- `HEAVY_THRESHOLD_MB` — installed size threshold for `--skip-heavy` in MB (default: 500)
 
 ## License
 
