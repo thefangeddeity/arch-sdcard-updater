@@ -8,7 +8,7 @@ url="https://github.com/thefangeddeity/arch-sdcard-updater"
 license=('GPL3')
 depends=('bash' 'yay' 'expac' 'tmux')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/thefangeddeity/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('d59d471634abb65620cdc47f8411260c20db9103de7665793b062602a357e931')
+sha256sums=('5385d28ab6402ba6d72e53fbdb1c236b76f32921708101657e9cdf6b2a518a38')
 
 package() {
     cd "$pkgname-$pkgver"

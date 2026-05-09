@@ -9,6 +9,6 @@ pkgbase = arch-sdcard-updater
 	depends = yay
 	depends = tmux
 	source = arch-sdcard-updater-1.0.0.tar.gz::https://github.com/thefangeddeity/arch-sdcard-updater/archive/refs/tags/v1.0.0.tar.gz
-	sha256sums = d59d471634abb65620cdc47f8411260c20db9103de7665793b062602a357e931
+	sha256sums = 5385d28ab6402ba6d72e53fbdb1c236b76f32921708101657e9cdf6b2a518a38
 
 pkgname = arch-sdcard-updater
