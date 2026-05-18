@@ -77,6 +77,7 @@ fi
 
 # ── tmux session pause ──────────────────────────────────────────────────────────────
 
+
 tmux_pause() {
     if [[ -n "${TMUX:-}" ]]; then
         echo ""
@@ -187,6 +188,9 @@ do_update() {
     if is_orphan "$pkg"; then
         echo "    ORPHAN: $pkg not found in repos or AUR — skipping"
         log_orphan "$pkg"
+        DONE_COUNT=$(( DONE_COUNT + 1 ))
+        DONE_BYTES=$(( DONE_BYTES + ${QUEUE_SIZES[$pkg]:-0} ))
+        print_progress
         return
     fi
 
@@ -214,6 +218,34 @@ do_update() {
         else
             log_fail "ERR [repo] $pkg"
         fi
+    fi
+    DONE_COUNT=$(( DONE_COUNT + 1 ))
+    DONE_BYTES=$(( DONE_BYTES + ${QUEUE_SIZES[$pkg]:-0} ))
+    print_progress
+}
+
+# ── Progress bar ─────────────────────────────────────────────────────────────
+
+print_progress() {
+    local pct=0
+    if (( TOTAL_BYTES > 0 )); then
+        pct=$(( DONE_BYTES * 100 / TOTAL_BYTES ))
+    elif (( TOTAL_COUNT > 0 )); then
+        pct=$(( DONE_COUNT * 100 / TOTAL_COUNT ))
+    fi
+    local filled=$(( pct * 20 / 100 ))
+    local empty=$(( 20 - filled ))
+    local bar="" i
+    for (( i=0; i<filled; i++ )); do bar+="█"; done
+    for (( i=0; i<empty; i++ )); do bar+="░"; done
+    local done_mb=$(( DONE_BYTES / 1024 / 1024 ))
+    local total_mb=$(( TOTAL_BYTES / 1024 / 1024 ))
+    local host
+    host=$(hostname)
+    echo ""
+    echo "==> Progress: [${bar}] ${pct}% (${DONE_COUNT}/${TOTAL_COUNT} pkgs · ${done_mb}MB / ${total_mb}MB)"
+    if [[ -n "${TMUX:-}" ]]; then
+        echo "    ${host}  ·  Detach: Ctrl+B, D  ·  Reattach: tmux attach -t sdupdate"
     fi
 }
 
@@ -380,6 +412,20 @@ while IFS= read -r line; do
         QUEUE+=("$pkg"); QUEUED["$pkg"]=1
     fi
 done < <(echo "$SIZED_DATA" | sort $SORT_FLAG)
+
+# ── Progress tracking ────────────────────────────────────────────────────────
+
+declare -A QUEUE_SIZES=()
+TOTAL_BYTES=0
+for pkg in "${QUEUE[@]}"; do
+    sz=$(echo "$SIZED_DATA" | awk -v p="$pkg" '$2==p {print $1; exit}')
+    sz=${sz:-0}
+    QUEUE_SIZES["$pkg"]=$sz
+    TOTAL_BYTES=$(( TOTAL_BYTES + sz ))
+done
+DONE_BYTES=0
+DONE_COUNT=0
+TOTAL_COUNT=${#QUEUE[@]}
 
 # ── Run the queue ─────────────────────────────────────────────────────────────
 
