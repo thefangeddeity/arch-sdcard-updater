@@ -1,6 +1,6 @@
 # Maintainer: Ron <thefangeddeity>
 pkgname=arch-sdcard-updater
-pkgver=1.1.0
+pkgver=1.1.1
 pkgrel=1
 pkgdesc="Space-aware incremental package updater for Arch Linux on SD cards"
 arch=('any')
@@ -8,7 +8,7 @@ url="https://github.com/thefangeddeity/arch-sdcard-updater"
 license=('GPL3')
 depends=('bash' 'yay' 'expac' 'tmux')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/thefangeddeity/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('7946dcb0686b7703e5f704c7ada4f0cdd93e45f0d8daf99ff5b562de7313a867')
+sha256sums=('cdec3540afd6df96d098bdcc2e25d683118b8f1a5d7cacf1ffb439cba7ab9fd4')
 
 package() {
     cd "$pkgname-$pkgver"
