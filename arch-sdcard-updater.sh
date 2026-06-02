@@ -240,8 +240,7 @@ print_progress() {
     for (( i=0; i<empty; i++ )); do bar+="░"; done
     local done_mb=$(( DONE_BYTES / 1024 / 1024 ))
     local total_mb=$(( TOTAL_BYTES / 1024 / 1024 ))
-    local host
-    host=$(hostname)
+    local host="${HOSTNAME:-$(uname -n)}"
     echo ""
     echo "==> Progress: [${bar}] ${pct}% (${DONE_COUNT}/${TOTAL_COUNT} pkgs · ${done_mb}MB / ${total_mb}MB)"
     if [[ -n "${TMUX:-}" ]]; then
