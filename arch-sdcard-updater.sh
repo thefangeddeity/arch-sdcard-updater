@@ -159,7 +159,7 @@ run_with_timeout() {
     if [[ "$is_aur_pkg" == "true" ]]; then
         local jobs mem_max
         if [[ "$OVERNIGHT_MODE" == "true" ]]; then
-            jobs=$(( $(nproc) / 4 ))
+            jobs=1
             mem_max="25%"
         else
             jobs=$(( $(nproc) / 2 ))
@@ -171,20 +171,20 @@ run_with_timeout() {
             export MAKEFLAGS="-j${jobs}"
             systemd-run --user --scope \
                 -p MemoryMax=${mem_max} \
-                -p Nice=19 \
                 -- \
+                nice -n 19 \
                 yay -S --noconfirm --needed \
                 --answerdiff=None --answerclean=None \
                 --removemake --cleanafter \
-                "$pkg" 2>"$tmp_err" &
+                "$pkg" &
         else
             nice -n 19 yay -S --noconfirm --needed \
                 --answerdiff=None --answerclean=None \
                 --removemake --cleanafter \
-                "$pkg" 2>"$tmp_err" &
+                "$pkg" &
         fi
     else
-        sudo pacman -S --noconfirm --needed "$pkg" 2>"$tmp_err" &
+        sudo pacman -S --noconfirm --needed "$pkg" &
     fi
 
     local child_pid=$!
@@ -204,10 +204,14 @@ run_with_timeout() {
 
     wait "$child_pid"
     local rc=$?
-    if grep -q 'could not satisfy dependencies\|breaks dependency' "$tmp_err" 2>/dev/null; then
-        cat "$tmp_err"
-        rm -f "$tmp_err"
-        return 3
+    if grep -q 'could not satisfy dependencies\|breaks dependency' /var/log/pacman.log 2>/dev/null; then
+        local last_err
+        last_err=$(grep 'could not satisfy\|breaks dependency' /var/log/pacman.log | tail -5)
+        if echo "$last_err" | grep -q "$pkg"; then
+            echo "$last_err"
+            rm -f "$tmp_err"
+            return 3
+        fi
     fi
     rm -f "$tmp_err"
     return $rc
