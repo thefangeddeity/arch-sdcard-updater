@@ -7,9 +7,11 @@ set -euo pipefail
 # ── Argument parsing ────────────────────────────────────────────────────────────────────────────────
 
 SKIP_HEAVY=false
+OVERNIGHT_MODE=false
 for arg in "$@"; do
     case "$arg" in
         --skip-heavy) SKIP_HEAVY=true ;;
+        --overnight-mode) OVERNIGHT_MODE=true ;;
         *) echo "Unknown argument: $arg"; exit 1 ;;
     esac
 done
@@ -151,28 +153,38 @@ run_with_timeout() {
     local is_aur_pkg="$3"
     local is_heavy="${4:-false}"
     local timeout_sec=$(( timeout_min * 60 ))
+    local tmp_err
+    tmp_err=$(mktemp)
 
     if [[ "$is_aur_pkg" == "true" ]]; then
-        local jobs=$(( $(nproc) / 2 ))
+        local jobs mem_max
+        if [[ "$OVERNIGHT_MODE" == "true" ]]; then
+            jobs=$(( $(nproc) / 4 ))
+            mem_max="25%"
+        else
+            jobs=$(( $(nproc) / 2 ))
+            mem_max="70%"
+        fi
         [[ $jobs -lt 1 ]] && jobs=1
-        if [[ "$is_heavy" == "true" ]] && command -v systemd-run &>/dev/null; then
+        if { [[ "$is_heavy" == "true" ]] || [[ "$OVERNIGHT_MODE" == "true" ]]; } \
+           && command -v systemd-run &>/dev/null; then
             export MAKEFLAGS="-j${jobs}"
             systemd-run --user --scope \
-                -p MemoryMax=70% \
+                -p MemoryMax=${mem_max} \
                 -p Nice=19 \
                 -- \
                 yay -S --noconfirm --needed \
                 --answerdiff=None --answerclean=None \
                 --removemake --cleanafter \
-                "$pkg" &
+                "$pkg" 2>"$tmp_err" &
         else
             nice -n 19 yay -S --noconfirm --needed \
                 --answerdiff=None --answerclean=None \
                 --removemake --cleanafter \
-                "$pkg" &
+                "$pkg" 2>"$tmp_err" &
         fi
     else
-        sudo pacman -S --noconfirm --needed "$pkg" &
+        sudo pacman -S --noconfirm --needed "$pkg" 2>"$tmp_err" &
     fi
 
     local child_pid=$!
@@ -191,7 +203,14 @@ run_with_timeout() {
     done
 
     wait "$child_pid"
-    return $?
+    local rc=$?
+    if grep -q 'could not satisfy dependencies\|breaks dependency' "$tmp_err" 2>/dev/null; then
+        cat "$tmp_err"
+        rm -f "$tmp_err"
+        return 3
+    fi
+    rm -f "$tmp_err"
+    return $rc
 }
 
 do_update() {
@@ -218,6 +237,9 @@ do_update() {
             log_fail "TIMEOUT [AUR] $pkg"
             TIMED_OUT_PKGS+=("$pkg")
             TIMED_OUT_TYPES+=("AUR")
+        elif [[ $rc -eq 3 ]]; then
+            echo "    DEP-CONFLICT: $pkg skipped — dependency version lock, will retry next run"
+            log_skip "DEP-CONFLICT [AUR] $pkg"
         elif [[ $rc -eq 0 ]]; then
             log_success "OK [AUR] $pkg"
         else
@@ -230,6 +252,9 @@ do_update() {
             log_fail "TIMEOUT [repo] $pkg"
             TIMED_OUT_PKGS+=("$pkg")
             TIMED_OUT_TYPES+=("repo")
+        elif [[ $rc -eq 3 ]]; then
+            echo "    DEP-CONFLICT: $pkg skipped — dependency version lock, will retry next run"
+            log_skip "DEP-CONFLICT [repo] $pkg"
         elif [[ $rc -eq 0 ]]; then
             log_success "OK [repo] $pkg"
         else
@@ -413,7 +438,9 @@ while IFS= read -r pkg; do
     fi
 done < <(echo "$SIZED_DATA" | sort $SORT_FLAG | awk '{print $2}')
 
-# AUR packages: sorted, skip already queued, skip heavy if flagged
+# AUR packages: binary first, then source-compiled, each sorted by size
+# Detect source vs binary by presence of build() in AUR PKGBUILD
+declare -a AUR_BINARY=() AUR_SOURCE=() AUR_BINARY_SIZES=() AUR_SOURCE_SIZES=()
 while IFS= read -r line; do
     size=$(awk '{print $1}' <<< "$line")
     pkg=$(awk '{print $2}' <<< "$line")
@@ -425,9 +452,21 @@ while IFS= read -r line; do
             QUEUED["$pkg"]=1
             continue
         fi
-        QUEUE+=("$pkg"); QUEUED["$pkg"]=1
+        echo "    Checking $pkg (binary or source?)..."
+        has_build=$(curl -sf "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=${pkg}" \
+            | grep -c "^build()" || true)
+        if (( has_build > 0 )); then
+            AUR_SOURCE+=("$pkg"); AUR_SOURCE_SIZES+=("$size")
+        else
+            AUR_BINARY+=("$pkg"); AUR_BINARY_SIZES+=("$size")
+        fi
+        QUEUED["$pkg"]=1
     fi
 done < <(echo "$SIZED_DATA" | sort $SORT_FLAG)
+
+# Binary AUR first (already size-sorted), then source-compiled
+for pkg in "${AUR_BINARY[@]}"; do QUEUE+=("$pkg"); done
+for pkg in "${AUR_SOURCE[@]}"; do QUEUE+=("$pkg"); done
 
 # ── Progress tracking ────────────────────────────────────────────────────────
 
