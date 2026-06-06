@@ -166,15 +166,18 @@ run_with_timeout() {
             if [[ "$OVERNIGHT_MODE" == "true" ]]; then
                 jobs=$(( $(nproc) / 4 ))
                 mem_max="25%"
+                cpu_quota="25%"
             else
                 jobs=$(( $(nproc) / 2 ))
                 mem_max="50%"
+                cpu_quota="50%"
             fi
             [[ $jobs -lt 1 ]] && jobs=1
             export MAKEFLAGS="-j${jobs}"
             if command -v systemd-run &>/dev/null; then
                 nice -n 19 systemd-run --user --scope \
                     -p MemoryMax=${mem_max} \
+                    -p CPUQuota=${cpu_quota} \
                     -- \
                     yay -S --noconfirm --needed \
                     --answerdiff=None --answerclean=None \
