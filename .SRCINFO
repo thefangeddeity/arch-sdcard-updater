@@ -1,6 +1,6 @@
 pkgbase = arch-sdcard-updater
 	pkgdesc = Space-aware incremental package updater for Arch Linux on SD cards
-	pkgver = 1.1.2
+	pkgver = 1.1.3
 	pkgrel = 1
 	url = https://github.com/thefangeddeity/arch-sdcard-updater
 	arch = any
@@ -8,7 +8,7 @@ pkgbase = arch-sdcard-updater
 	depends = bash
 	depends = yay
 	depends = tmux
-	source = arch-sdcard-updater-1.1.2.tar.gz::https://github.com/thefangeddeity/arch-sdcard-updater/archive/refs/tags/v1.1.2.tar.gz
-	sha256sums = a41dad7b2e86dd5199be11aec6f09308bf132c3cf35f270688ac0ee793281acf
+	source = arch-sdcard-updater-1.1.3.tar.gz::https://github.com/thefangeddeity/arch-sdcard-updater/archive/refs/tags/v1.1.3.tar.gz
+	sha256sums = 2b8c2e2a09b6652750dab9a9a2eb06c55e15a376f106bc27b1c548cb4780e604
 
 pkgname = arch-sdcard-updater
