@@ -149,13 +149,28 @@ run_with_timeout() {
     local pkg="$1"
     local timeout_min="$2"
     local is_aur_pkg="$3"
+    local is_heavy="${4:-false}"
     local timeout_sec=$(( timeout_min * 60 ))
 
     if [[ "$is_aur_pkg" == "true" ]]; then
-        yay -S --noconfirm --needed \
-            --answerdiff=None --answerclean=None \
-            --removemake --cleanafter \
-            "$pkg" &
+        local jobs=$(( $(nproc) / 2 ))
+        [[ $jobs -lt 1 ]] && jobs=1
+        if [[ "$is_heavy" == "true" ]] && command -v systemd-run &>/dev/null; then
+            export MAKEFLAGS="-j${jobs}"
+            systemd-run --user --scope \
+                -p MemoryMax=70% \
+                -p Nice=19 \
+                -- \
+                yay -S --noconfirm --needed \
+                --answerdiff=None --answerclean=None \
+                --removemake --cleanafter \
+                "$pkg" &
+        else
+            nice -n 19 yay -S --noconfirm --needed \
+                --answerdiff=None --answerclean=None \
+                --removemake --cleanafter \
+                "$pkg" &
+        fi
     else
         sudo pacman -S --noconfirm --needed "$pkg" &
     fi
@@ -195,8 +210,10 @@ do_update() {
     fi
 
     if is_aur "$pkg"; then
-        local rc
-        run_with_timeout "$pkg" "$TIMEOUT_AUR_MIN" "true" && rc=$? || rc=$?
+        local rc heavy="false"
+        (( ${QUEUE_SIZES[$pkg]:-0} > HEAVY_THRESHOLD_MB * 1024 * 1024 )) && heavy="true"
+        [[ "$heavy" == "true" ]] && echo "    HEAVY: running at nice -n 19"
+        run_with_timeout "$pkg" "$TIMEOUT_AUR_MIN" "true" "$heavy" && rc=$? || rc=$?
         if [[ $rc -eq 2 ]]; then
             log_fail "TIMEOUT [AUR] $pkg"
             TIMED_OUT_PKGS+=("$pkg")
@@ -338,7 +355,7 @@ else
     echo "==> Keyring up to date — skipping."
 fi
 echo "==> Collecting updatable packages..."
-mapfile -t UPDATABLE < <({ pacman -Qu 2>/dev/null; yay -Qua --aur 2>/dev/null; } | awk '{print $1}' | sort -u)
+mapfile -t UPDATABLE < <({ pacman -Qu 2>/dev/null || true; yay -Qua --aur 2>/dev/null || true; } | awk '{print $1}' | sort -u)
 
 if [[ ${#UPDATABLE[@]} -eq 0 ]]; then
     echo "==> Nothing to update."
