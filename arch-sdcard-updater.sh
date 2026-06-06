@@ -8,10 +8,12 @@ set -euo pipefail
 
 SKIP_HEAVY=false
 OVERNIGHT_MODE=false
+NO_PROTECTION=false
 for arg in "$@"; do
     case "$arg" in
         --skip-heavy) SKIP_HEAVY=true ;;
         --overnight-mode) OVERNIGHT_MODE=true ;;
+        --no-protection) NO_PROTECTION=true ;;
         *) echo "Unknown argument: $arg"; exit 1 ;;
     esac
 done
@@ -153,35 +155,38 @@ run_with_timeout() {
     local is_aur_pkg="$3"
     local is_heavy="${4:-false}"
     local timeout_sec=$(( timeout_min * 60 ))
-    local tmp_err
-    tmp_err=$(mktemp)
-
     if [[ "$is_aur_pkg" == "true" ]]; then
-        local jobs mem_max
-        if [[ "$OVERNIGHT_MODE" == "true" ]]; then
-            jobs=1
-            mem_max="25%"
-        else
-            jobs=$(( $(nproc) / 2 ))
-            mem_max="70%"
-        fi
-        [[ $jobs -lt 1 ]] && jobs=1
-        if { [[ "$is_heavy" == "true" ]] || [[ "$OVERNIGHT_MODE" == "true" ]]; } \
-           && command -v systemd-run &>/dev/null; then
-            export MAKEFLAGS="-j${jobs}"
-            systemd-run --user --scope \
-                -p MemoryMax=${mem_max} \
-                -- \
-                nice -n 19 \
-                yay -S --noconfirm --needed \
-                --answerdiff=None --answerclean=None \
-                --removemake --cleanafter \
-                "$pkg" &
-        else
+        if [[ "$NO_PROTECTION" == "true" ]]; then
             nice -n 19 yay -S --noconfirm --needed \
                 --answerdiff=None --answerclean=None \
                 --removemake --cleanafter \
                 "$pkg" &
+        else
+            local jobs mem_max
+            if [[ "$OVERNIGHT_MODE" == "true" ]]; then
+                jobs=$(( $(nproc) / 4 ))
+                mem_max="25%"
+            else
+                jobs=$(( $(nproc) / 2 ))
+                mem_max="50%"
+            fi
+            [[ $jobs -lt 1 ]] && jobs=1
+            export MAKEFLAGS="-j${jobs}"
+            if command -v systemd-run &>/dev/null; then
+                systemd-run --user --scope \
+                    -p MemoryMax=${mem_max} \
+                    -p Nice=19 \
+                    -- \
+                    yay -S --noconfirm --needed \
+                    --answerdiff=None --answerclean=None \
+                    --removemake --cleanafter \
+                    "$pkg" &
+            else
+                nice -n 19 yay -S --noconfirm --needed \
+                    --answerdiff=None --answerclean=None \
+                    --removemake --cleanafter \
+                    "$pkg" &
+            fi
         fi
     else
         sudo pacman -S --noconfirm --needed "$pkg" &
@@ -205,15 +210,9 @@ run_with_timeout() {
     wait "$child_pid"
     local rc=$?
     if grep -q 'could not satisfy dependencies\|breaks dependency' /var/log/pacman.log 2>/dev/null; then
-        local last_err
-        last_err=$(grep 'could not satisfy\|breaks dependency' /var/log/pacman.log | tail -5)
-        if echo "$last_err" | grep -q "$pkg"; then
-            echo "$last_err"
-            rm -f "$tmp_err"
-            return 3
-        fi
+        grep 'could not satisfy\|breaks dependency' /var/log/pacman.log | tail -5
+        return 3
     fi
-    rm -f "$tmp_err"
     return $rc
 }
 
