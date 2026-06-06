@@ -173,9 +173,8 @@ run_with_timeout() {
             [[ $jobs -lt 1 ]] && jobs=1
             export MAKEFLAGS="-j${jobs}"
             if command -v systemd-run &>/dev/null; then
-                systemd-run --user --scope \
+                nice -n 19 systemd-run --user --scope \
                     -p MemoryMax=${mem_max} \
-                    -p Nice=19 \
                     -- \
                     yay -S --noconfirm --needed \
                     --answerdiff=None --answerclean=None \
